@@ -930,6 +930,103 @@ async def shopify_create_webhook(params: CreateWebhookInput) -> str:
         return _error(e)
 
 
+import re  # noqa: E402  (used by the GraphQL guard below)
+
+# ═══════════════════════════════════════════════════════════════════════════
+# GRAPHQL  (Admin API surface the REST endpoints don't expose)
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Mutations this tool may run. Anything not listed is refused.
+# Override per-service with SHOPIFY_GRAPHQL_ALLOWED_MUTATIONS="a,b,c".
+# Set it to an empty string to make the tool read-only.
+_DEFAULT_ALLOWED_MUTATIONS = {
+    "productUpdate",
+    "productSet",
+    "productVariantsBulkUpdate",
+    "inventoryItemUpdate",
+    "metafieldsSet",
+    "collectionCreate",
+    "collectionUpdate",
+    "collectionAddProducts",
+    "collectionRemoveProducts",
+    "publishablePublish",
+}
+
+_env_allow = os.environ.get("SHOPIFY_GRAPHQL_ALLOWED_MUTATIONS")
+ALLOWED_MUTATIONS = (
+    {m.strip() for m in _env_allow.split(",") if m.strip()}
+    if _env_allow is not None
+    else _DEFAULT_ALLOWED_MUTATIONS
+)
+
+_MUTATION_RE   = re.compile(r"\bmutation\b", re.IGNORECASE)
+_ROOT_FIELD_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)\s*\(")
+
+
+class GraphQLInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    query:     str                      = Field(..., description="GraphQL query or mutation document")
+    variables: Optional[Dict[str, Any]] = Field(default=None, description="Variables object for the document")
+
+
+@mcp.tool(
+    name="shopify_graphql",
+    annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": True},
+)
+async def shopify_graphql(params: GraphQLInput) -> str:
+    """Run a GraphQL query or mutation against this store's Shopify Admin API.
+
+    Use for anything the REST tools do not cover: inventoryItem.unitCost (cost per
+    item), metafields (SEO title/description and shopify.* category attributes), the
+    standard taxonomy category, collections, and metaobjects.
+
+    Reads are unrestricted. Mutations are limited to an allowlist and delete/destroy
+    mutations are always refused.
+    """
+    try:
+        if _MUTATION_RE.search(params.query):
+            called = set(_ROOT_FIELD_RE.findall(params.query))
+            forbidden = {
+                c for c in called
+                if c.endswith(("Delete", "Destroy")) and c not in ALLOWED_MUTATIONS
+            }
+            if forbidden:
+                raise RuntimeError(
+                    f"Refused: destructive mutation(s) {sorted(forbidden)}. "
+                    f"Allowed: {sorted(ALLOWED_MUTATIONS)}"
+                )
+            if not (called & ALLOWED_MUTATIONS):
+                raise RuntimeError(
+                    "Refused: document contains no allowed mutation. "
+                    f"Allowed: {sorted(ALLOWED_MUTATIONS)}"
+                )
+
+        data = await _request(
+            "POST", "graphql.json",
+            body={"query": params.query, "variables": params.variables or {}},
+        )
+
+        # Shopify answers HTTP 200 even when the operation failed. Surface both the
+        # top-level `errors` and per-mutation `userErrors`, otherwise a write that
+        # did nothing comes back looking like a success.
+        if data.get("errors"):
+            raise RuntimeError(f"GraphQL errors: {json.dumps(data['errors'], default=str)}")
+
+        payload  = data.get("data") or {}
+        problems = {}
+        for key, value in payload.items():
+            if isinstance(value, dict):
+                errs = value.get("userErrors") or value.get("mediaUserErrors")
+                if errs:
+                    problems[key] = errs
+        if problems:
+            raise RuntimeError(f"userErrors: {json.dumps(problems, default=str)}")
+
+        return _fmt(payload)
+    except Exception as e:
+        return _error(e)
+
+
 # ---------------------------------------------------------------------------
 # Entrypoint
 # ---------------------------------------------------------------------------
